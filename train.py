@@ -83,7 +83,6 @@ valid_loader = DataLoader(
         max_length=args.max_length,
         mask_rate=args.mask_rate,
     ),
-    pin_memory=device.type == "cuda",
 )
 test_loader = DataLoader(
     test_dataset,
@@ -93,10 +92,9 @@ test_loader = DataLoader(
         max_length=args.max_length,
         mask_rate=args.mask_rate,
     ),
-    pin_memory=device.type == "cuda",
 )
 #train_steps = len(train_loader)
-train_steps = 32 # testing memorization
+train_steps = 1 # testing memorization
 valid_steps = len(valid_loader)
 test_steps = len(test_loader)
 
