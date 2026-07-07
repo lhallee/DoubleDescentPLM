@@ -1,3 +1,5 @@
+import entrypoint_setup
+
 import argparse
 import sys
 
@@ -43,7 +45,6 @@ def get_args() -> argparse.Namespace:
         default="small"
     )
     parser.add_argument("--num_epochs", type=int, default=10)
-    parser.add_argument("--steps_per_epoch", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -85,6 +86,7 @@ test_loader = DataLoader(
     collate_fn=TokenizeCollator(max_length=args.max_length),
     pin_memory=device.type == "cuda",
 )
+train_steps = len(train_loader)
 valid_steps = len(valid_loader)
 test_steps = len(test_loader)
 
@@ -97,10 +99,10 @@ optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 train_losses, valid_losses = [], []
 
 for epoch in tqdm(range(args.num_epochs)):
-    train_dataset.set_epoch(0) # repeatable selection to enable grokking
+    train_dataset.set_epoch(0) # repeatable selection to look at grokking
     model.train()
     train_loss_tally = 0.0
-    for step, batch in tqdm(zip(range(args.steps_per_epoch), train_loader), total=args.steps_per_epoch):
+    for step, batch in tqdm(zip(range(train_steps), train_loader), total=train_steps):
         batch = move_to_device(batch, device)
         # train step
         optimizer.zero_grad()
@@ -111,7 +113,7 @@ for epoch in tqdm(range(args.num_epochs)):
 
         train_loss_tally += loss.item()
 
-    train_loss_average = train_loss_tally / args.steps_per_epoch
+    train_loss_average = train_loss_tally / train_steps
     train_losses.append(train_loss_average)
     
     valid_dataset.set_epoch(0)
