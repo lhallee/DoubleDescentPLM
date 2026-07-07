@@ -111,7 +111,7 @@ class TokenizeCollator:
         seqs = [sample['seqs'].strip().upper() for sample in batch]
         tokenized = self.tokenizer(
             seqs,
-            padding='max-length',
+            padding='max_length',
             add_special_tokens=True,
             max_length=self.max_length,
             truncation=True,
