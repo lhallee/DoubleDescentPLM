@@ -65,7 +65,7 @@ valid_steps = len(valid_loader)
 test_steps = len(test_loader)
 
 
-model = PLM(config=args.model_config).to(device)
+model = PLM(config=model_config).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
 train_losses, valid_losses = [], []
