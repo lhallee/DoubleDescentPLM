@@ -85,12 +85,10 @@ class TokenizeCollator:
     def __init__(
             self,
             max_length: int = 512,
-            device: torch.device = "cuda",
             mask_rate: float = 0.15
         ):
         self.tokenizer = EsmTokenizer.from_pretrained('facebook/esm2_t6_8M_UR50D')
         self.max_length = max_length
-        self.device = device
         self.mask_rate = mask_rate
         self.mask_token = self.tokenizer.mask_token_id
 
@@ -120,9 +118,9 @@ class TokenizeCollator:
         )
         input_ids, labels = self.mask(tokenized)
         return {
-            'input_ids': input_ids.to(self.device),
-            'attention_mask': tokenized['attention_mask'].to(self.device),
-            'labels': labels.to(self.device),
+            'input_ids': input_ids,
+            'attention_mask': tokenized['attention_mask'],
+            'labels': labels,
         }
 
 

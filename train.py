@@ -5,6 +5,7 @@ import torch
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from typing import Dict
 
 from model.config import PLMConfig
 from model.plm import PLM
@@ -21,6 +22,10 @@ def seed_all(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def move_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
 def get_args() -> argparse.Namespace:
@@ -60,22 +65,25 @@ train_loader = DataLoader(
     train_dataset,
     batch_size=args.batch_size,
     shuffle=False,
-    collate_fn=TokenizeCollator(max_length=args.max_length, device=device),
+    collate_fn=TokenizeCollator(max_length=args.max_length),
     num_workers=4,
-    prefetch_factor=2
+    prefetch_factor=2,
+    pin_memory=device.type == "cuda",
 )
 # we leave out works for eval sets since they are tiny
 valid_loader = DataLoader(
     valid_dataset,
     batch_size=args.batch_size,
     shuffle=False,
-    collate_fn=TokenizeCollator(max_length=args.max_length, device=device)
+    collate_fn=TokenizeCollator(max_length=args.max_length),
+    pin_memory=device.type == "cuda",
 )
 test_loader = DataLoader(
     test_dataset,
     batch_size=args.batch_size,
     shuffle=False,
-    collate_fn=TokenizeCollator(max_length=args.max_length, device=device)
+    collate_fn=TokenizeCollator(max_length=args.max_length),
+    pin_memory=device.type == "cuda",
 )
 valid_steps = len(valid_loader)
 test_steps = len(test_loader)
@@ -93,7 +101,8 @@ for epoch in tqdm(range(args.num_epochs)):
     model.train()
     train_loss_tally = 0.0
     for step, batch in tqdm(zip(range(args.steps_per_epoch), train_loader), total=args.steps_per_epoch):
-
+        batch = move_to_device(batch, device)
+        # train step
         optimizer.zero_grad()
         output = model(**batch)
         loss = output.loss
@@ -110,6 +119,7 @@ for epoch in tqdm(range(args.num_epochs)):
     valid_loss_tally = 0.0
     with torch.no_grad():
         for batch in tqdm(valid_loader, total=valid_steps):
+            batch = move_to_device(batch, device)
             output = model(**batch)
             valid_loss_tally += output.loss.item()
 
