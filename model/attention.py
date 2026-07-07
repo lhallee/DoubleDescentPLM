@@ -41,12 +41,6 @@ class Attention(nn.Module):
         self.Wo = nn.Linear(self.hidden_size, self.hidden_size)
 
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        assert len(x.shape) == 3, "Expecting (b, l, d) hidden state"
-        b, l, d = x.shape
-        if attention_mask is None:
-            attention_mask = torch.ones((b, l), dtype=x.dtype, device=x.device) 
-        assert len(attention_mask.shape) == 2, "Expecting 2d attention mask (b, l)"
-        attention_mask = attention_mask[:, None, None, :].bool() # (b, l, l)
         QKV = self.layernorm_Wqkv(x) # (b, l, 3d)
         Q, K, V = torch.chunk(QKV, 3, dim=-1) # (b, l, d)
         Q, K = self.q_ln(Q).to(Q.dtype), self.k_ln(K).to(K.dtype)
