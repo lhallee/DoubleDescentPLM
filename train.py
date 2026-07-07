@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Dict
 
-from model.config import PLMConfig
 from model.plm import PLM
 from data.sampler import PDBClusteredDataset, TokenizeCollator
 from configs import MODEL_CONFIGS
