@@ -1,4 +1,5 @@
 import argparse
+import sys
 
 import torch
 import matplotlib.pyplot as plt
@@ -9,6 +10,17 @@ from model.config import PLMConfig
 from model.plm import PLM
 from data.sampler import PDBClusteredDataset, TokenizeCollator
 from configs import MODEL_CONFIGS
+
+
+def seed_all(seed: int = 42) -> None:
+    import random
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def get_args() -> argparse.Namespace:
@@ -35,6 +47,7 @@ def get_args() -> argparse.Namespace:
 
 
 args = get_args()
+seed_all()
 model_config = MODEL_CONFIGS[args.config]
 args.plot_path = f"{args.config}.png"
 
@@ -47,8 +60,11 @@ train_loader = DataLoader(
     train_dataset,
     batch_size=args.batch_size,
     shuffle=False,
-    collate_fn=TokenizeCollator(max_length=args.max_length, device=device)
+    collate_fn=TokenizeCollator(max_length=args.max_length, device=device),
+    num_workers=4,
+    prefetch_factor=2
 )
+# we leave out works for eval sets since they are tiny
 valid_loader = DataLoader(
     valid_dataset,
     batch_size=args.batch_size,
@@ -66,6 +82,8 @@ test_steps = len(test_loader)
 
 
 model = PLM(config=model_config).to(device)
+if sys.platform.startswith("linux"):
+    model = torch.compile(model)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
 train_losses, valid_losses = [], []
