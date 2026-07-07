@@ -95,7 +95,8 @@ test_loader = DataLoader(
     ),
     pin_memory=device.type == "cuda",
 )
-train_steps = len(train_loader)
+#train_steps = len(train_loader)
+train_steps = 32 # testing memorization
 valid_steps = len(valid_loader)
 test_steps = len(test_loader)
 
