@@ -138,15 +138,15 @@ for epoch in tqdm(range(args.num_epochs)):
     valid_loss_average = valid_loss_tally / valid_steps
     valid_losses.append(valid_loss_average)
 
-
-assert len(train_losses) == len(valid_losses), "Expecting the same size"
-epochs = range(1, len(train_losses) + 1)
-plt.figure()
-plt.plot(epochs, train_losses, label="train")
-plt.plot(epochs, valid_losses, label="valid")
-plt.xlabel("Epoch")
-plt.ylabel("Average loss")
-plt.legend()
-plt.tight_layout()
-plt.savefig(args.plot_path, dpi=300)
-plt.close()
+    # plot every epoch so can look at over time
+    assert len(train_losses) == len(valid_losses), "Expecting the same size"
+    epochs = range(1, len(train_losses) + 1)
+    plt.figure()
+    plt.plot(epochs, train_losses, label="train")
+    plt.plot(epochs, valid_losses, label="valid")
+    plt.xlabel("Epoch")
+    plt.ylabel("Average loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(args.plot_path, dpi=300)
+    plt.close()
