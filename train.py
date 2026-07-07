@@ -47,6 +47,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--mask_rate", type=float, default=0.15)
     #parser.add_argument("--plot_path", type=str, default="loss.png")
     return parser.parse_args()
 
@@ -65,7 +66,10 @@ train_loader = DataLoader(
     train_dataset,
     batch_size=args.batch_size,
     shuffle=False,
-    collate_fn=TokenizeCollator(max_length=args.max_length),
+    collate_fn=TokenizeCollator(
+        max_length=args.max_length,
+        mask_rate=args.mask_rate,
+    ),
     num_workers=4,
     prefetch_factor=2,
     pin_memory=device.type == "cuda",
@@ -75,14 +79,20 @@ valid_loader = DataLoader(
     valid_dataset,
     batch_size=args.batch_size,
     shuffle=False,
-    collate_fn=TokenizeCollator(max_length=args.max_length),
+    collate_fn=TokenizeCollator(
+        max_length=args.max_length,
+        mask_rate=args.mask_rate,
+    ),
     pin_memory=device.type == "cuda",
 )
 test_loader = DataLoader(
     test_dataset,
     batch_size=args.batch_size,
     shuffle=False,
-    collate_fn=TokenizeCollator(max_length=args.max_length),
+    collate_fn=TokenizeCollator(
+        max_length=args.max_length,
+        mask_rate=args.mask_rate,
+    ),
     pin_memory=device.type == "cuda",
 )
 train_steps = len(train_loader)
@@ -91,6 +101,7 @@ test_steps = len(test_loader)
 
 
 model = PLM(config=model_config).to(device)
+print(model)
 if sys.platform.startswith("linux"):
     model = torch.compile(model)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
