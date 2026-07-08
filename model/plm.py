@@ -1,13 +1,29 @@
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from typing import Optional
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
-from dataclasses import dataclass
 
 from model.config import PLMConfig
 from model.attention import Attention
 from model.mlp import MLP
+
+
+class ValueEmbedding(nn.Module):
+    def __init__(self, config: PLMConfig):
+        super().__init__()
+        self.embed = nn.ModuleList(
+            [
+                nn.Embedding(config.vocab_size, config.hidden_size)
+                for _ in range(config.num_hidden_layers // 2)
+            ]
+        )
+
+    def forward(self, input_ids: torch.Tensor) -> list[torch.Tensor]:
+        encoder_values = [embedding(input_ids) for embedding in self.embed]
+        return encoder_values + list(reversed(encoder_values))
 
 
 class TransformerBlock(nn.Module):
@@ -16,8 +32,17 @@ class TransformerBlock(nn.Module):
         self.attention = Attention(config)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
-        x = x + self.attention(x=x, attention_mask=attention_mask)
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        value_embedding: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = x + self.attention(
+            x=x,
+            attention_mask=attention_mask,
+            value_embedding=value_embedding,
+        )
         x = x + self.mlp(x=x)
         return x
 
@@ -33,9 +58,13 @@ class LMHead(nn.Module):
             nn.LayerNorm(self.hidden_size, bias=True),
             nn.Linear(self.hidden_size, self.vocab_size, bias=True)
         )
+        self.soft_logit_cap = config.soft_logit_cap
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(x)
+        logits = self.head(x)
+        if self.soft_logit_cap is not None:
+            logits = self.soft_logit_cap * torch.tanh(logits / self.soft_logit_cap)
+        return logits
 
 
 @dataclass
@@ -48,15 +77,26 @@ class PLM(PreTrainedModel):
     config_class = PLMConfig
     def __init__(self, config: PLMConfig):
         super().__init__(config=config)
+        self.config = config
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
+        self.unet = config.unet
+        if self.unet and config.num_hidden_layers % 2 != 0:
+            raise ValueError("UNet PLM requires an even number of hidden layers")
+        self.use_value_embeddings = config.value_embeddings
+        if self.use_value_embeddings and not self.unet:
+            raise ValueError("value_embeddings requires unet=True")
         self.embedding = nn.Embedding(self.vocab_size, self.hidden_size)
+        if self.use_value_embeddings:
+            self.value_embeddings = ValueEmbedding(config)
         self.blocks = nn.ModuleList(
             [
                 TransformerBlock(config=config)
                 for i in range(config.num_hidden_layers)
             ]
         )
+        if self.unet:
+            self.skip_weights = nn.Parameter(torch.ones(config.num_hidden_layers // 2))
         self.norm = nn.LayerNorm(self.hidden_size, bias=False)
         self.lm_head = LMHead(config=config)
         self.ce_loss = nn.CrossEntropyLoss()
@@ -70,14 +110,39 @@ class PLM(PreTrainedModel):
         assert len(input_ids.shape) == 2, "Input ids should be (b, l)"
         b, l = input_ids.shape
         if attention_mask is None:
-            attention_mask = torch.ones((b, l), device=x.device) 
+            attention_mask = torch.ones((b, l), device=input_ids.device, dtype=torch.bool)
         assert len(attention_mask.shape) == 2, "Expecting 2d attention mask (b, l)"
         assert input_ids.shape == attention_mask.shape, "Input ids and attention mask should be the same shape"
-        attention_mask = attention_mask[:, None, None, :].bool() # (b, l, l)
+        attention_mask = attention_mask.bool()
 
         x = self.embedding(input_ids) # (b, l, d)
-        for block in self.blocks:
-            x = block(x=x, attention_mask=attention_mask)
+
+        if self.unet:
+            num_encoder_layers = len(self.blocks) // 2
+            value_embeddings = (
+                self.value_embeddings(input_ids)
+                if self.use_value_embeddings
+                else [None] * len(self.blocks)
+            )
+            skip_connections = []
+            for layer_index, block in enumerate(self.blocks[:num_encoder_layers]):
+                x = block(
+                    x=x,
+                    attention_mask=attention_mask,
+                    value_embedding=value_embeddings[layer_index],
+                )
+                skip_connections.append(x)
+            for i, block in enumerate(self.blocks[num_encoder_layers:]):
+                x = x + self.skip_weights[i] * skip_connections.pop()
+                layer_index = num_encoder_layers + i
+                x = block(
+                    x=x,
+                    attention_mask=attention_mask,
+                    value_embedding=value_embeddings[layer_index],
+                )
+        else:
+            for block in self.blocks:
+                x = block(x=x, attention_mask=attention_mask)
         last_hidden_state = self.norm(x)
         logits = self.lm_head(last_hidden_state)
 

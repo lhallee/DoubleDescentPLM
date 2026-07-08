@@ -1,32 +1,97 @@
+import math
+from typing import Any, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from functools import partial
-from einops import rearrange
-from typing import Optional
 
 from model.config import PLMConfig
 
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+except ImportError:
+    create_block_mask = None
+    flex_attention = None
 
-def rope(x: torch.Tensor, theta: float = 10000.0) -> torch.Tensor:
-    b, n, l, h = x.shape
-    assert h % 2 == 0, "rope requires an even head size"
 
-    x_float = x.float()
-    freq = 1.0 / (theta ** (torch.arange(0, h, 2, device=x.device).float() / h))
-    pos = torch.arange(l, device=x.device, dtype=freq.dtype)
-    angle = torch.outer(pos, freq)
-    cos = angle.cos().view(1, 1, l, h // 2)
-    sin = angle.sin().view(1, 1, l, h // 2)
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    compiler_disable = torch.compiler.disable
+else:
+    compiler_disable = lambda fn: fn
 
-    x_pair = x_float.reshape(b, n, l, h // 2, 2)
-    x_even, x_odd = x_pair.unbind(dim=-1)
-    x_rotated = torch.stack(
-        (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos),
-        dim=-1,
+
+@compiler_disable
+def build_flex_key_padding_block_mask(
+    attention_mask: torch.Tensor,
+    num_heads: int,
+) -> Any:
+    if create_block_mask is None:
+        raise RuntimeError("FlexAttention is not available in this PyTorch build")
+    if attention_mask.dim() == 4:
+        attention_mask = attention_mask[:, 0, 0, :]
+    if attention_mask.dim() != 2:
+        raise ValueError("FlexAttention key padding mask must have shape (batch, length)")
+
+    key_padding_mask = attention_mask.bool()
+    batch_size, sequence_length = key_padding_mask.shape
+
+    def key_padding_mask_mod(b, h, q_idx, kv_idx):
+        return key_padding_mask[b, kv_idx]
+
+    return create_block_mask(
+        mask_mod=key_padding_mask_mod,
+        B=batch_size,
+        H=num_heads,
+        Q_LEN=sequence_length,
+        KV_LEN=sequence_length,
+        device=key_padding_mask.device,
     )
-    return x_rotated.flatten(-2).type_as(x)
+
+
+class Rotary(nn.Module):
+    def __init__(self, head_size: int, theta: float = 10000.0):
+        super().__init__()
+        assert head_size % 2 == 0, "rope requires an even head size"
+        self.head_size = head_size
+        self.theta = theta
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_size, 2).float() / head_size))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.sequence_length_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def _update_cache(self, sequence_length: int, device: torch.device) -> None:
+        cache_is_valid = (
+            self.sequence_length_cached == sequence_length
+            and self.cos_cached is not None
+            and self.sin_cached is not None
+            and self.cos_cached.device == device
+        )
+        if cache_is_valid:
+            return
+
+        positions = torch.arange(sequence_length, device=device, dtype=self.inv_freq.dtype)
+        angles = torch.outer(positions, self.inv_freq.to(device))
+        self.sequence_length_cached = sequence_length
+        self.cos_cached = angles.cos().view(1, 1, sequence_length, self.head_size // 2)
+        self.sin_cached = angles.sin().view(1, 1, sequence_length, self.head_size // 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, num_heads, sequence_length, head_size = x.shape
+        assert head_size == self.head_size, "unexpected head size"
+        self._update_cache(sequence_length, x.device)
+
+        x_float = x.float()
+        x_pair = x_float.reshape(batch_size, num_heads, sequence_length, head_size // 2, 2)
+        x_even, x_odd = x_pair.unbind(dim=-1)
+        x_rotated = torch.stack(
+            (
+                x_even * self.cos_cached - x_odd * self.sin_cached,
+                x_even * self.sin_cached + x_odd * self.cos_cached,
+            ),
+            dim=-1,
+        )
+        return x_rotated.flatten(-2).type_as(x)
 
 
 class Attention(nn.Module):
@@ -36,6 +101,7 @@ class Attention(nn.Module):
         self.head_size = config.head_size # h
         self.num_heads = self.hidden_size // self.head_size # n
         self.scale = 1.0 / math.sqrt(self.head_size)
+        self.attention_backend = config.attention_backend
 
         self.layernorm_Wqkv = nn.Sequential(
             nn.LayerNorm(self.hidden_size, bias=False),
@@ -43,19 +109,92 @@ class Attention(nn.Module):
         )
         self.q_ln = nn.LayerNorm(self.hidden_size, bias=False)
         self.k_ln = nn.LayerNorm(self.hidden_size, bias=False)
-        self.add_heads = partial(rearrange, pattern="b l (h d) -> b h l d", h=self.num_heads)
-        self.remove_heads = partial(rearrange, pattern="b h l d -> b l (h d)")
+        self.rotary = Rotary(self.head_size)
+        if config.value_embeddings:
+            self.value_lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        else:
+            self.value_lambdas = None
         self.Wo = nn.Linear(self.hidden_size, self.hidden_size)
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.attention_backend == "flex":
+            if flex_attention is None:
+                raise RuntimeError("attention_backend='flex' requires PyTorch FlexAttention")
+            if not hasattr(torch, "compile"):
+                raise RuntimeError("attention_backend='flex' requires torch.compile")
+            self.flex_attention = torch.compile(flex_attention)
+
+    def add_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_size = x.shape
+        assert hidden_size == self.hidden_size, "unexpected hidden size"
+        return x.view(batch_size, sequence_length, self.num_heads, self.head_size).transpose(1, 2)
+
+    def remove_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, num_heads, sequence_length, head_size = x.shape
+        assert num_heads == self.num_heads, "unexpected number of heads"
+        assert head_size == self.head_size, "unexpected head size"
+        return x.transpose(1, 2).contiguous().view(batch_size, sequence_length, self.hidden_size)
+
+    def prepare_attention_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        batch_size: int,
+        sequence_length: int,
+        device: torch.device,
+    ) -> Any:
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, sequence_length),
+                device=device,
+                dtype=torch.bool,
+            )
+        if attention_mask.dim() != 2:
+            raise ValueError("attention_mask must have shape (batch, length)")
+        if attention_mask.shape != (batch_size, sequence_length):
+            raise ValueError("attention_mask shape must match input batch and length")
+
+        attention_mask = attention_mask.bool()
+        if self.attention_backend == "flex":
+            return build_flex_key_padding_block_mask(
+                attention_mask,
+                num_heads=self.num_heads,
+            )
+        return attention_mask[:, None, None, :]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[Any] = None,
+        value_embedding: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, sequence_length, _ = x.shape
+        attention_mask = self.prepare_attention_mask(
+            attention_mask=attention_mask,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            device=x.device,
+        )
         QKV = self.layernorm_Wqkv(x) # (b, l, 3d)
         Q, K, V = torch.chunk(QKV, 3, dim=-1) # (b, l, d)
         Q, K = self.q_ln(Q).to(Q.dtype), self.k_ln(K).to(K.dtype)
         Q, K, V = map(self.add_heads, (Q, K, V)) # (b, n, l, h)
-        Q, K = rope(Q), rope(K)
-        A = F.scaled_dot_product_attention(
-            Q, K, V, attn_mask=attention_mask, scale=self.scale
-        ) # (b, n, l, h)
+        if value_embedding is not None:
+            if self.value_lambdas is None:
+                raise ValueError("value embeddings were provided but config.value_embeddings is false")
+            value_embedding = self.add_heads(value_embedding.to(dtype=V.dtype))
+            V = self.value_lambdas[0] * V + self.value_lambdas[1] * value_embedding
+        Q, K = self.rotary(Q), self.rotary(K)
+        if self.attention_backend == "flex":
+            A = self.flex_attention(
+                Q,
+                K,
+                V,
+                score_mod=None,
+                block_mask=attention_mask,
+            ) # (b, n, l, h)
+        else:
+            A = F.scaled_dot_product_attention(
+                Q, K, V, attn_mask=attention_mask, scale=self.scale
+            ) # (b, n, l, h)
         A = self.remove_heads(A) # (b, l, d)
         O = self.Wo(A)
         return O
@@ -82,7 +221,7 @@ if __name__ == "__main__":
     rope_length, rope_head_size = l, attention_layer.head_size
     rope_input = torch.zeros((1, 1, rope_length, rope_head_size), device=device)
     rope_input[..., 0::2] = 1.0
-    rope_output = rope(rope_input)
+    rope_output = attention_layer.rotary(rope_input)
 
     assert torch.allclose(
         rope_input.norm(dim=-1),
